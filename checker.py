@@ -204,6 +204,37 @@ _FREIGHT_NOT_INCLUDED = {"EXW", "FCA", "FAS", "FOB"}
 _FREIGHT_INCLUDED = {"CIF", "CFR", "CNF", "C&F", "CIP", "CPT", "DAP", "DPU", "DAT", "DDP"}
 
 
+def _alloc_groups(meta: list) -> list:
+    """
+    Chia bộ tờ khai thành các NHÓM PHÂN BỔ cước / bảo hiểm.
+    QUY TẮC (theo nghiệp vụ):
+      - Các tờ khai NHÁNH của cùng 1 tờ khai (cùng 'Số tờ khai đầu tiên', VD nhánh 1/2, 2/2) -> 1 nhóm.
+        Mỗi nhánh mặc định khai NGUYÊN số cước của cả nhóm, KHÔNG chia theo trị giá.
+      - Chỉ khi 1 vận đơn tách thành NHIỀU TỜ KHAI KHÁC NHAU (khác số TK đầu tiên: khác loại hình,
+        khác điều kiện thanh toán...) mới phân bổ cước giữa các nhóm theo trị giá hàng.
+    Trả về list (khóa nhóm, [meta các tờ khai trong nhóm], tỷ lệ phân bổ của nhóm).
+    """
+    groups: dict[str, list] = {}
+    for m_ in meta:
+        k = str(m_.get("first_declaration_no") or m_.get("declaration_no") or id(m_))
+        groups.setdefault(k, []).append(m_)
+    gv = {k: sum(float(x.get("goods_value") or 0) for x in lst) for k, lst in groups.items()}
+    total = sum(gv.values())
+    return [(k, lst, (gv[k] / total) if total > 0 else 1.0 / len(groups)) for k, lst in groups.items()]
+
+
+def _who(m_: dict, meta: list) -> str:
+    """Tiền tố tên tờ khai trong ghi chú lỗi, có kèm số nhánh nếu là tờ khai nhánh."""
+    if len(meta) <= 1:
+        return ""
+    br = f" (nhánh {m_.get('branch_no')}/{m_.get('total_branches')})" if str(m_.get("total_branches") or "") not in ("", "0", "1") else ""
+    return f"TK {m_.get('declaration_no')}{br}: "
+
+
+def _dd0(draft: dict, key: str) -> str:
+    return str((draft or {}).get(key) or "").strip()
+
+
 def _total_of(doc: dict, key: str, item_key: str) -> float:
     return _num(doc.get(key)) or sum(_num(x.get(item_key)) for x in (doc.get("items") or []))
 
@@ -224,6 +255,7 @@ def run_full_reconciliation(
     export_decls: list | None = None,
     debit_note: dict | None = None,
     barcodes: list | None = None,
+    insurance: list | None = None,
 ) -> dict:
     issues: list[IssueRow] = []
     H = "HEADER"
@@ -324,6 +356,23 @@ def run_full_reconciliation(
                 "ERROR", f"Danh sách container trên tờ khai khác {ref_name} (" + "; ".join(detail) + ")",
             ))
 
+    # Mã vạch <-> B/L: so trực tiếp danh sách container (không phụ thuộc container khai trên tờ khai)
+    if barcodes and bl:
+        _cn = lambda s_: re.sub(r"[^A-Z0-9]", "", str(s_ or "").upper())
+        bar_set = {_cn(x_) for x_ in bar_conts if _cn(x_)}
+        bl_set = {_cn(x_) for x_ in (bl.get("containers") or []) if _cn(x_)}
+        if bar_set and bl_set and bar_set != bl_set:
+            detail = []
+            if bl_set - bar_set:
+                detail.append("mã vạch THIẾU so với B/L: " + ", ".join(sorted(bl_set - bar_set)))
+            if bar_set - bl_set:
+                detail.append("mã vạch THỪA so với B/L: " + ", ".join(sorted(bar_set - bl_set)))
+            issues.append(IssueRow(H, "Mã vạch", H, "CONTAINERS", ", ".join(sorted(bar_set)), ", ".join(sorted(bl_set)),
+                                   "ERROR", "Số container trên mã vạch khác B/L (" + "; ".join(detail) + ")"))
+        elif not bar_set or not bl_set:
+            issues.append(IssueRow(H, "Mã vạch", H, "CONTAINERS", ", ".join(sorted(bar_set)), ", ".join(sorted(bl_set)),
+                                   "WARNING", "Không đọc được danh sách container ở mã vạch hoặc B/L - tự kiểm tra"))
+
     # Mã hiệu phương thức vận chuyển = 2: đếm container trên vận đơn, đối chiếu với số lượng container khai trên tờ khai
     meta = draft.get("decl_meta") or [{"declaration_no": draft.get("declaration_no", ""), "transport_mode_code": draft.get("transport_mode_code", ""),
                                        "internal_ref_no": draft.get("internal_ref_no", "")}]
@@ -353,7 +402,11 @@ def run_full_reconciliation(
             issues.append(IssueRow(H, "Incoterm", H, "FREIGHT", f"{fr:,.2f}", f"Điều kiện {inc}", "WARNING",
                                    f"{who}Điều kiện giá {inc} đã gồm cước vận chuyển nhưng tờ khai vẫn khai thêm phí vận chuyển"))
 
-    # Debit note: đối chiếu cước với phí vận chuyển trên tờ khai (đổi tiền theo tỷ giá tính thuế; 1 debit note chia nhiều tờ khai thì phân bổ theo trị giá hàng)
+    # Debit note: đối chiếu cước với phí vận chuyển trên tờ khai (đổi tiền theo tỷ giá tính thuế).
+    # - Tờ khai nhánh (cùng Số TK đầu tiên): mỗi nhánh phải khai NGUYÊN cước, không phân bổ.
+    # - 1 bill tách nhiều tờ khai KHÁC nhau: phân bổ cước theo trị giá hàng của từng tờ khai (gộp các nhánh của nó).
+    alloc_groups = _alloc_groups(meta)
+    n_alloc = len(alloc_groups)
     dn_show = ""
     if debit_note:
         dn_amt = _num(debit_note.get("freight_amount"))
@@ -362,16 +415,20 @@ def run_full_reconciliation(
         if dn_amt <= 0:
             issues.append(IssueRow(H, "Debit note", H, "FREIGHT", "", "KHÔNG ĐỌC ĐƯỢC CƯỚC", "WARNING", "Không đọc được cước vận chuyển quốc tế trên debit note - tự kiểm tra"))
         else:
-            total_gv = sum(float(m_.get("goods_value") or 0) for m_ in meta)
-            for m_ in meta:
-                share = (float(m_.get("goods_value") or 0) / total_gv) if total_gv > 0 else 1.0 / len(meta)
+            for _, members_, share in alloc_groups:
+              for m_ in members_:
                 fr = float(m_.get("freight_amount") or 0)
                 tk_cur = (m_.get("freight_currency") or ("VND" if fr > 100000 else (m_.get("currency") or "USD"))).upper()
                 rates = {**(draft.get("exchange_rates") or {}), **(m_.get("exchange_rates") or {})}
                 alloc = dn_amt * share
                 conv, note = _convert(alloc, dn_cur, tk_cur, rates)
-                who = f"TK {m_.get('declaration_no')}: " if len(meta) > 1 else ""
-                share_txt = f", phân bổ {share:.1%} theo trị giá hàng" if len(meta) > 1 else ""
+                who = _who(m_, meta)
+                if n_alloc > 1:
+                    share_txt = f", phân bổ {share:.1%} theo trị giá hàng"
+                elif len(members_) > 1:
+                    share_txt = ", tờ khai nhánh: mỗi nhánh khai nguyên cước, không phân bổ"
+                else:
+                    share_txt = ""
                 if conv is None:
                     issues.append(IssueRow(H, "Debit note", H, "FREIGHT", f"{fr:,.2f} {tk_cur}", dn_show, "WARNING",
                                            f"{who}Không quy đổi được cước debit note để so với tờ khai ({note})"))
@@ -380,14 +437,88 @@ def run_full_reconciliation(
                     issues.append(IssueRow(H, "Debit note", H, "FREIGHT", f"{fr:,.2f} {tk_cur}", f"{conv:,.2f} {tk_cur}", "ERROR",
                                            f"{who}Phí vận chuyển trên tờ khai khác debit note (debit note {dn_show}{share_txt}" + (f"; {note}" if note else "") + ")"))
 
+    # Phí bảo hiểm: cộng các chứng từ bảo hiểm (đổi về 1 tiền tệ), so với tờ khai (chia nhiều tờ khai thì phân bổ theo trị giá hàng)
+    insurance = [x_ for x_ in (insurance or []) if x_]
+    ins_show = ""
+    # Tổng trên tờ khai: nhánh cùng Số TK đầu tiên chỉ tính 1 lần (mỗi nhánh đều ghi nguyên phí)
+    d_ins_total = sum(max(float(x.get("insurance_amount") or 0) for x in lst) for _, lst, _ in alloc_groups)
+    d_ins_cur = (draft.get("insurance_currency") or "") or ("VND" if d_ins_total > 100000 else str(draft.get("currency") or ""))
+    if insurance:
+        ins_cur = str(insurance[0].get("premium_currency") or d_ins_cur or "USD").upper()
+        rates0 = draft.get("exchange_rates") or {}
+        ins_amt, ins_fail = 0.0, []
+        for x_ in insurance:
+            conv, note = _convert(_num(x_.get("premium_amount")), str(x_.get("premium_currency") or ins_cur).upper(), ins_cur, rates0)
+            if conv is None:
+                ins_fail.append(f"{x_.get('file_name')}: {note}")
+            else:
+                ins_amt += conv
+        ins_show = f"{ins_amt:,.2f} {ins_cur}"
+        if ins_fail:
+            issues.append(IssueRow(H, "Bảo hiểm", H, "INSURANCE", f"{d_ins_total:,.2f} {d_ins_cur}", ins_show, "WARNING",
+                                   "Không quy đổi được phí bảo hiểm (" + "; ".join(ins_fail) + ")"))
+        elif ins_amt <= 0:
+            issues.append(IssueRow(H, "Bảo hiểm", H, "INSURANCE", "", "KHÔNG ĐỌC ĐƯỢC PHÍ", "WARNING", "Không đọc được phí bảo hiểm - tự kiểm tra"))
+        else:
+            # Cùng quy tắc với cước: nhánh giữ nguyên, chỉ phân bổ giữa các tờ khai khác nhau
+            for m_, share in [(m_, sh) for _, lst, sh in alloc_groups for m_ in lst]:
+                tk_v = float(m_.get("insurance_amount") or 0)
+                tk_cur = (m_.get("insurance_currency") or ("VND" if tk_v > 100000 else (m_.get("currency") or "USD"))).upper()
+                rates = {**rates0, **(m_.get("exchange_rates") or {})}
+                conv, note = _convert(ins_amt * share, ins_cur, tk_cur, rates)
+                who = _who(m_, meta)
+                share_txt = f", phân bổ {share:.1%} theo trị giá hàng" if n_alloc > 1 else ""
+                if conv is None:
+                    issues.append(IssueRow(H, "Bảo hiểm", H, "INSURANCE", f"{tk_v:,.2f} {tk_cur}", ins_show, "WARNING",
+                                           f"{who}Không quy đổi được phí bảo hiểm để so với tờ khai ({note})"))
+                elif abs(tk_v - conv) > max(0.01 * max(tk_v, conv), 0.01):
+                    issues.append(IssueRow(H, "Bảo hiểm", H, "INSURANCE", f"{tk_v:,.2f} {tk_cur}", f"{conv:,.2f} {tk_cur}", "ERROR",
+                                           f"{who}Phí bảo hiểm trên tờ khai khác chứng từ bảo hiểm (chứng từ {ins_show}{share_txt}"
+                                           + (f"; {note}" if note else "") + ")"))
+
     # Số hóa đơn / ngày hóa đơn: đối chiếu với Invoice
     d_inv_nos = draft.get("invoice_nos") or ([re.sub(r"^\s*[A-Z]\s*-\s*", "", str(draft.get("invoice_no") or "")).strip()] if draft.get("invoice_no") else [])
     d_inv_dates = draft.get("invoice_dates") or ([str(draft.get("invoice_date")).strip()] if str(draft.get("invoice_date") or "").strip() else [])
-    if invoice and d_inv_nos and norm_code(invoice.get("invoice_no")):
-        cn = norm_code(invoice.get("invoice_no"))
-        if not any(norm_code(x) == cn or (len(min(norm_code(x), cn, key=len)) >= 4 and (norm_code(x) in cn or cn in norm_code(x))) for x in d_inv_nos):
-            issues.append(IssueRow(H, "Invoice", H, "INVOICE_NO", ", ".join(d_inv_nos), _norm(invoice.get("invoice_no")), "ERROR",
-                                   "Số hóa đơn trên tờ khai khác Invoice"))
+    inv_nos = [x_ for x_ in (invoice.get("invoice_nos") or [invoice.get("invoice_no")] if invoice else []) if norm_code(x_)]
+
+    def _inv_same(a_, b_):
+        a_, b_ = norm_code(a_), norm_code(b_)
+        return a_ == b_ or (len(min(a_, b_, key=len)) >= 4 and (a_ in b_ or b_ in a_))
+
+    if invoice and d_inv_nos and inv_nos:
+        not_on_tk = [x_ for x_ in inv_nos if not any(_inv_same(x_, y_) for y_ in d_inv_nos)]
+        not_on_inv = [y_ for y_ in d_inv_nos if not any(_inv_same(x_, y_) for x_ in inv_nos)]
+        if not_on_tk:
+            issues.append(IssueRow(H, "Invoice", H, "INVOICE_NO", ", ".join(d_inv_nos), ", ".join(inv_nos), "ERROR",
+                                   "Số hóa đơn trên tờ khai khác Invoice (Invoice có nhưng tờ khai không có: " + ", ".join(not_on_tk) + ")"))
+        elif not_on_inv:
+            issues.append(IssueRow(H, "Invoice", H, "INVOICE_NO", ", ".join(d_inv_nos), ", ".join(inv_nos), "WARNING",
+                                   "Tờ khai có số hóa đơn chưa có trong các Invoice đã tải: " + ", ".join(not_on_inv) + " - kiểm tra có thiếu file invoice không"))
+
+    # Invoice không thương mại (hàng không thanh toán) <-> phương thức thanh toán KHONGTT trên tờ khai
+    for br in (invoice.get("invoice_breakdown") or []) if invoice else []:
+        for m_ in meta:
+            if br.get("invoice_no") and norm_code(m_.get("invoice_no_clean")) and _inv_same(br["invoice_no"], m_.get("invoice_no_clean")):
+                pay = str(m_.get("payment_method") or "").upper()
+                who = f"TK {m_.get('declaration_no')}: " if len(meta) > 1 else ""
+                if br.get("is_non_commercial") and pay and pay != "KHONGTT":
+                    issues.append(IssueRow(H, "Invoice", H, "PAYMENT", f"{pay}", "KHÔNG THANH TOÁN (non commercial)", "ERROR",
+                                           f"{who}Invoice {br['invoice_no']} là invoice không thương mại (hàng không thanh toán) nhưng tờ khai khai phương thức thanh toán {pay} - phải là KHONGTT"))
+                elif not br.get("is_non_commercial") and pay == "KHONGTT":
+                    issues.append(IssueRow(H, "Invoice", H, "PAYMENT", "KHONGTT", "CÓ THANH TOÁN", "WARNING",
+                                           f"{who}Tờ khai khai KHONGTT nhưng Invoice {br['invoice_no']} không thấy ghi là hàng không thanh toán - kiểm tra lại"))
+
+    # Tổng ghi trên invoice phải khớp tổng các dòng hàng (bắt lỗi đọc số), và không cộng lẫn nhiều đồng tiền
+    if invoice:
+        for br in invoice.get("invoice_breakdown") or []:
+            t_, s_ = br.get("total_amount") or 0, br.get("total_items_sum") or 0
+            if t_ > 0 and s_ > 0 and abs(t_ - s_) > max(0.05, 0.001 * t_):
+                issues.append(IssueRow(H, "Invoice", H, "TOTAL_AMOUNT", f"{s_:,.2f} (cộng các dòng)", f"{t_:,.2f} (ghi ở dòng tổng)", "WARNING",
+                                       f"Invoice {br.get('invoice_no')}: tổng ghi trên invoice khác tổng các dòng hàng đọc được - kiểm tra lại cách đọc số / dòng bị sót"))
+        if invoice.get("mixed_currency"):
+            issues.append(IssueRow(H, "Invoice", H, "CURRENCY", _dd0(draft, "currency"), ", ".join(sorted({br.get("currency") for br in invoice.get("invoice_breakdown") or [] if br.get("currency")})), "WARNING",
+                                   "Các invoice khác đồng tiền nhưng tổng trị giá đang cộng chung - xem chi tiết từng invoice"))
+
     if invoice and d_inv_dates and _norm(invoice.get("invoice_date")):
         res_d = [compare_dates(x, invoice.get("invoice_date")) for x in d_inv_dates]
         if not any(r[0] for r in res_d):
@@ -660,9 +791,9 @@ def run_full_reconciliation(
         return ", ".join(sorted(_norm(c) for c in (doc.get("containers") or []) if _norm(c))) if doc else ""
 
     ref_cols = {"B/L": "B/L", "Arrival Notice": "Arrival Notice", "Packing List": "Packing List", "Invoice": "Invoice",
-                "Debit note": "Debit note", "Mã vạch": "Mã vạch", "Tờ khai xuất": "Tờ khai xuất"}
+                "Debit note": "Debit note", "Mã vạch": "Mã vạch", "Tờ khai xuất": "Tờ khai xuất", "Bảo hiểm": "Bảo hiểm"}
     docs = {"B/L": bl, "Arrival Notice": arrival_notice, "Packing List": packing_list, "Invoice": invoice,
-            "Debit note": debit_note, "Mã vạch": barcodes or None, "Tờ khai xuất": export_decls}
+            "Debit note": debit_note, "Mã vạch": barcodes or None, "Tờ khai xuất": export_decls, "Bảo hiểm": insurance or None}
 
     def _seal_txt(d):
         rows_ = d.get("container_seals") if isinstance(d, dict) else [x for b_ in (d or []) for x in (b_.get("container_seals") or [])]
@@ -676,7 +807,8 @@ def run_full_reconciliation(
             return ""
         return _norm(d.get("bl_no")) + (f" (master: {_norm(d.get('master_bl_no'))})" if d.get("master_bl_no") else "")
 
-    d_fr_total = sum(float(m_.get("freight_amount") or 0) for m_ in meta)
+    # Nhánh cùng Số TK đầu tiên chỉ tính cước 1 lần (không cộng trùng 2 nhánh)
+    d_fr_total = sum(max(float(x.get("freight_amount") or 0) for x in lst) for _, lst, _ in alloc_groups)
     d_fr_cur = next((m_.get("freight_currency") for m_ in meta if m_.get("freight_currency")), "") or ("VND" if d_fr_total > 100000 else "")
 
     def _tot(doc, key, item_key, fmt):
@@ -699,8 +831,11 @@ def run_full_reconciliation(
          str(d_cc) if (is2 and d_cc) else "", lambda d: str(b_cc) if (is2 and d is bl and b_cc) else "", ("B/L",)),
         ("STORAGE", "Địa điểm lưu kho", _dd("storage_location"), lambda d: "", ()),
         ("TRANSPORT", "Phương tiện vận chuyển", _dd("transport_means"), lambda d: _norm(d.get("vessel_flight")) if d else "", ("B/L", "Arrival Notice")),
-        ("INVOICE_NO", "Số hóa đơn", ", ".join(d_inv_nos), lambda d: _norm(d.get("invoice_no")) if d else "", ("Invoice",)),
-        ("INVOICE_DATE", "Ngày hóa đơn", ", ".join(fmt_date(x) for x in d_inv_dates), lambda d: fmt_date(d.get("invoice_date")) if d and d.get("invoice_date") else "", ("Invoice",)),
+        ("INVOICE_NO", "Số hóa đơn", ", ".join(d_inv_nos), lambda d: ", ".join(d.get("invoice_nos") or [_norm(d.get("invoice_no"))]) if d else "", ("Invoice",)),
+        ("INVOICE_DATE", "Ngày hóa đơn", ", ".join(fmt_date(x) for x in d_inv_dates), lambda d: ", ".join(dict.fromkeys(fmt_date(x_) for x_ in (d.get("invoice_dates") or [d.get("invoice_date")]) if x_)) if d else "", ("Invoice",)),
+        ("PAYMENT", "Phương thức thanh toán (KHONGTT = hàng không thanh toán)",
+         "; ".join(dict.fromkeys(f"{m_.get('payment_method')}" for m_ in meta if m_.get("payment_method"))),
+         lambda d: ("Có invoice không thương mại: " + ", ".join(br["invoice_no"] for br in d.get("invoice_breakdown") or [] if br.get("is_non_commercial"))) if d and d.get("is_non_commercial") else "", ("Invoice",)),
         ("INCOTERMS", "Incoterm", _dd("incoterms"), lambda d: str(d.get("incoterms") or "") if d else "", ("Invoice",)),
         ("CURRENCY", "Đơn vị tiền tệ", _dd("currency"), lambda d: str(d.get("currency") or "") if d else "", ("Invoice",)),
         ("TOTAL_AMOUNT", "Tổng trị giá hóa đơn", f"{d_amt:.2f}" if d_amt else "", lambda d: _tot(d, "total_amount", "amount", lambda v: f"{v:.2f}"), ("Invoice",)),
@@ -712,6 +847,7 @@ def run_full_reconciliation(
          lambda d: _bar_conts(d) if isinstance(d, list) else _cont(d), ("B/L", "Arrival Notice", "Packing List", "Mã vạch")),
         ("SEAL", "Số seal container", "", _seal_txt, ("B/L", "Arrival Notice", "Mã vạch")),
         ("FREIGHT", "Phí vận chuyển", f"{d_fr_total:,.2f} {d_fr_cur}".strip() if d_fr_total else "", lambda d: dn_show, ("Debit note",)),
+        ("INSURANCE", "Phí bảo hiểm", f"{d_ins_total:,.2f} {d_ins_cur}".strip() if d_ins_total else "", lambda d: ins_show, ("Bảo hiểm",)),
         ("TOTAL_NW", "Tổng Net Weight", f"{d_nw:.3f}" if d_nw else "", lambda d: _tot(d, "total_net_weight", "net_weight", lambda v: f"{v:.3f}"), ("Packing List", "Invoice")),
     ]
     header_rows = []
@@ -788,3 +924,61 @@ def run_full_reconciliation(
         "header_table": header_table,
         "line_tables": line_tables,
     }
+
+
+# ---------------------------------------------------------------------
+# Tiện ích cho bảng chọn phí debit note và các thông báo cần lưu ý
+# ---------------------------------------------------------------------
+
+VAT_EXW = 1.08
+CAT_LABEL = {"OCEAN_FREIGHT": "Ocean Freight", "FREIGHT_SURCHARGE": "Phụ phí cước", "EXW": "Phí EXW / đại lý", "OTHER": "Khác"}
+CAT_BY_LABEL = {v: k for k, v in CAT_LABEL.items()}
+
+
+def incoterm3(v) -> str:
+    return re.sub(r"[^A-Z&]", "", str(v or "").upper())[:3]
+
+
+def default_charge_tick(inc: str, cat: str, is_intl: bool = False) -> bool:
+    """Mặc định tick khoản phí nào vào phí vận chuyển: EXW = Ocean Freight + phí EXW/đại lý; đầu F = chỉ Ocean Freight; còn lại theo cờ cước quốc tế."""
+    if inc == "EXW":
+        return cat in ("OCEAN_FREIGHT", "EXW")
+    if inc.startswith("F"):
+        return cat == "OCEAN_FREIGHT"
+    return bool(is_intl)
+
+
+def charge_net(amount: float, includes_vat: bool) -> float:
+    """Số tiền chưa VAT 8% (chia 1,08 nếu số tiền đã gồm VAT)."""
+    return amount / VAT_EXW if includes_vat else amount
+
+
+_SURCHARGE_RULES = [
+    ("PCS - phụ phí tắc nghẽn cảng (Port Congestion Surcharge)", re.compile(r"\bPCS\b|PORT[\s\-]*CONGESTION|CONGESTION|TẮC\s*NGHẼN|TAC\s*NGHEN", re.I)),
+    ("LSS - phụ phí lưu huỳnh thấp (Low Sulphur Surcharge)", re.compile(r"\bLSS\b|LOW[\s\-]*SUL(?:PH|F)UR|LƯU\s*HUỲNH|LUU\s*HUYNH", re.I)),
+]
+
+
+def collect_notices(debit_docs: list | None, arrival_notice: dict | None, draft: dict | None) -> list[str]:
+    """Các thông báo cần lưu ý: phí PCS/LSS trên debit note hoặc A/N; HS đầu 28/29 phải khai báo hóa chất."""
+    notices: list[str] = []
+    for dn in debit_docs or []:
+        for ch in dn.get("charges") or []:
+            for label, rx in _SURCHARGE_RULES:
+                if rx.search(str(ch.get("description") or "")):
+                    notices.append(f"Debit note {dn.get('file_name', '')}: có phí {label} - '{ch.get('description')}' "
+                                   f"({_num(ch.get('amount')):,.2f} {ch.get('currency') or ''}). Kiểm tra có tính vào phí vận chuyển không.")
+    if arrival_notice:
+        for desc in arrival_notice.get("charge_descriptions") or []:
+            for label, rx in _SURCHARGE_RULES:
+                if rx.search(str(desc)):
+                    notices.append(f"Arrival Notice: có phí {label} - '{desc}'. Kiểm tra có tính vào phí vận chuyển không.")
+    chem = []
+    for it in (draft or {}).get("items") or []:
+        hs = re.sub(r"\D", "", str(it.get("hs_code") or ""))
+        if hs.startswith(("28", "29")):
+            chem.append(f"{it.get('item_code') or '?'} (HS {hs})")
+    if chem:
+        shown = ", ".join(list(dict.fromkeys(chem))[:10]) + (" ..." if len(set(chem)) > 10 else "")
+        notices.append(f"Đừng quên Khai Báo Hoá Chất - tờ khai có mã HS đầu 28 hoặc 29: {shown}")
+    return notices

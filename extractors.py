@@ -3,6 +3,8 @@ import functools
 import hashlib
 import io
 import json
+import math
+import numbers
 import re
 import time
 import os
@@ -81,6 +83,8 @@ class SplitInvPkData(BaseModel):
     currency: str = Field(default="", description="Đồng tiền trên Invoice")
     incoterms: str = Field(default="", description="Incoterms trên Invoice")
     total_amount: float = Field(default=0.0, description="Tổng trị giá trên Invoice")
+    is_non_commercial: bool = Field(default=False, description="True nếu Invoice là NON COMMERCIAL INVOICE / hàng không thanh toán (có chữ NON COMMERCIAL, FOC, FREE OF CHARGE, NO PAYMENT / NOPAYMENT, SAMPLE không thanh toán, NO COMMERCIAL VALUE)")
+    payment_terms: str = Field(default="", description="Điều khoản thanh toán chép đúng như in (VD: T/T 30 DAYS, NOPAYMENT)")
     total_net_weight: float = Field(default=0.0, description="Tổng Net Weight trên Packing List")
     total_gross_weight: float = Field(default=0.0, description="Tổng Gross Weight trên Packing List")
     total_pkg_count: float = Field(default=0.0, description="Tổng số kiện trên Packing List")
@@ -100,6 +104,10 @@ def _parse_vnaccs_number(val) -> float:
     """Chuyển chuỗi số VNACCS (VD: '1.460,8574' hoặc '63,45' hoặc '5.281.885') sang float."""
     if val is None or (isinstance(val, float) and pd.isna(val)):
         return 0.0
+    if isinstance(val, numbers.Real) and not isinstance(val, bool):
+        # Đã là số (JSON của Gemini, ô số của Excel): giữ nguyên, KHÔNG đoán dấu chấm/phẩy
+        # (trước đây 522.738 bị đọc thành 522738 vì tưởng dấu chấm là ngăn cách hàng nghìn)
+        return 0.0 if (isinstance(val, float) and math.isnan(val)) else float(val)
     s = str(val).strip()
     if not s or s == "-":
         return 0.0
@@ -116,6 +124,22 @@ def _parse_vnaccs_number(val) -> float:
         if len(parts) > 2 or (len(parts) == 2 and len(parts[1]) == 3 and len(parts[0]) <= 3 and s.count(".") == 1):
             if len(parts[-1]) == 3 and all(p.isdigit() for p in parts):
                 s = "".join(parts)
+    try:
+        return float(s)
+    except ValueError:
+        return 0.0
+
+
+def _parse_vn_text(val) -> float:
+    """Số dạng chữ trên tờ khai VNACCS: dấu chấm = ngăn cách hàng nghìn, dấu phẩy = thập phân
+    (VD '522,738' = 522.738; '7.578,26' = 7578.26; '25.640' = 25640)."""
+    s = re.sub(r"\s", "", str(val if val is not None else ""))
+    if not s or s == "-":
+        return 0.0
+    if "," in s:
+        s = s.replace(".", "").replace(",", ".")
+    elif re.fullmatch(r"-?\d{1,3}(\.\d{3})+", s):
+        s = s.replace(".", "")
     try:
         return float(s)
     except ValueError:
@@ -238,6 +262,17 @@ def _parse_vnaccs_import_xls(raw: bytes) -> dict:
             return str(df.iloc[r, c]).strip()
         return ""
 
+    def num_at(r: int, c: int) -> float:
+        """Đọc số tại ô: ô kiểu số giữ nguyên, ô kiểu chữ đọc theo quy ước VNACCS (chấm = nghìn, phẩy = thập phân)."""
+        if not (0 <= r < n_rows and 0 <= c < n_cols):
+            return 0.0
+        v = df.iloc[r, c]
+        if not isinstance(v, str) and pd.isna(v):
+            return 0.0
+        if isinstance(v, numbers.Real) and not isinstance(v, bool):
+            return float(v)
+        return _parse_vn_text(v)
+
     # ---- đọc theo NHÃN (không phụ thuộc cố định vị trí ô) ----
     item_row0 = next((r for r in range(n_rows) if cell(r, 2).lower() == "mã số hàng hóa"), n_rows)
     page1_end = next((r for r in range(1, n_rows) if cell(r, 2).startswith("<IMP>")), item_row0)
@@ -330,13 +365,13 @@ def _parse_vnaccs_import_xls(raw: bytes) -> dict:
         internal_ref = ""
     bl_no = cell(30, 3) or cell(30, 2)
     eta = cell(34, 20)
-    total_pkg = _parse_vnaccs_number(cell(35, 10))
-    total_gw = _parse_vnaccs_number(cell(36, 10))
+    total_pkg = num_at(35, 10)
+    total_gw = num_at(36, 10)
     invoice_no = cell(40, 9)
 
     inv_meta_str = cell(44, 9)
     incoterms, currency = _extract_incoterm_currency(inv_meta_str)
-    total_amount = _parse_vnaccs_number(cell(44, 15))
+    total_amount = num_at(44, 15)
 
     def adjustment(label: str) -> tuple:
         """Phí vận chuyển / bảo hiểm: ô đầu dạng 'D - VND - ' (phân loại - tiền tệ - ...), số tiền nằm ở ô bên phải."""
@@ -350,7 +385,7 @@ def _parse_vnaccs_import_xls(raw: bytes) -> dict:
                 cur = m[0] if m else ""
                 continue
             if re.fullmatch(r"[\d.,]+", v.strip()):
-                amt = _parse_vnaccs_number(v)
+                amt = num_at(pos[0], cc)
                 break
         return amt, cur
 
@@ -368,7 +403,7 @@ def _parse_vnaccs_import_xls(raw: bytes) -> dict:
                 if re.fullmatch(r"[A-Z]{3}", t):
                     for t2 in toks[i + 1:]:
                         if re.fullmatch(r"[\d.,]+", t2):
-                            exchange_rates[t] = _parse_vnaccs_number(t2)
+                            exchange_rates[t] = _parse_vn_text(t2)
                             break
 
     importer_tax = ""
@@ -392,10 +427,10 @@ def _parse_vnaccs_import_xls(raw: bytes) -> dict:
                 item_code = parts[0].strip().upper()
                 description = parts[1].strip()
 
-            qty = _parse_vnaccs_number(cell(r + 4, 21))
+            qty = num_at(r + 4, 21)
             unit = cell(r + 4, 30).upper()
-            amount = _parse_vnaccs_number(cell(r + 6, 8))
-            unit_price = _parse_vnaccs_number(cell(r + 6, 21))
+            amount = num_at(r + 6, 8)
+            unit_price = num_at(r + 6, 21)
 
             items.append({
                 "item_code": item_code,
@@ -531,6 +566,23 @@ def _load_import_draft_raw(
     raise ValueError(f"Chưa hỗ trợ định dạng file tờ khai nháp: {uploaded_file.name}")
 
 
+_NONCOMM_RX = re.compile(r"NON[\s\-]*COMMERCIAL|NO[\s\-]*COMMERCIAL[\s\-]*VALUE|\bFOC\b|FREE[\s\-]*OF[\s\-]*CHARGE|NO[\s\-]*PAYMENT", re.I)
+
+
+def _excel_non_commercial(raw: bytes) -> bool:
+    """Excel invoice: có chữ NON COMMERCIAL / FOC / NOPAYMENT... ở bất kỳ ô nào không."""
+    try:
+        xl = pd.ExcelFile(io.BytesIO(raw))
+        for sh in xl.sheet_names:
+            df_ = xl.parse(sh, header=None, nrows=60)
+            for v in df_.astype(str).values.ravel():
+                if _NONCOMM_RX.search(v):
+                    return True
+    except Exception:
+        pass
+    return False
+
+
 def load_combined_invoice_packing_list(
     uploaded_file,
     api_key: Optional[str] = None,
@@ -579,6 +631,9 @@ def load_combined_invoice_packing_list(
             "total_net_weight": sum(x["net_weight"] for x in inv_items),
             "total_gross_weight": sum(x["gross_weight"] for x in inv_items),
             "total_pkg_count": sum(x["pkg_count"] for x in inv_items),
+            "total_items_sum": sum(x["amount"] for x in inv_items),
+            "is_non_commercial": _excel_non_commercial(raw),
+            "file_name": uploaded_file.name,
             "items": inv_items,
         }
         pk_doc = {
@@ -602,7 +657,11 @@ def load_combined_invoice_packing_list(
             "cùng tổng trị giá, Incoterms, đồng tiền, tổng NW, tổng GW, tổng số kiện. "
             "Với mỗi dòng hàng: item_code là mã hàng chính; alt_codes là các mã khác trên cùng dòng "
             "(Model, Style, Customer item, mã nằm trong tên hàng...), chỉ chép nguyên văn chuỗi mã, không chép mô tả. "
-            "Đọc thêm số hóa đơn (Invoice No.) và ngày hóa đơn (Invoice Date) trên Commercial Invoice."
+            "Đọc thêm số hóa đơn (Invoice No.) và ngày hóa đơn (Invoice Date) trên Commercial Invoice. "
+            "Nếu tiêu đề là NON COMMERCIAL INVOICE hoặc hàng không thanh toán (FOC, FREE OF CHARGE, NO PAYMENT / NOPAYMENT, hàng mẫu không thanh toán) "
+            "thì đặt is_non_commercial = true; vẫn đọc số tiền ghi trên invoice (giá trị khai báo) vào amount / total_amount. "
+            "Ghi điều khoản thanh toán (PAYMENT) vào payment_terms. "
+            "Số có dấu chấm hoặc phẩy phải giữ đúng số thập phân (VD 522.738 là năm trăm hai mươi hai phẩy bảy ba tám, KHÔNG phải 522738)."
         )
         split = _call_gemini_json(raw, prompt, SplitInvPkData, api_key=api_key, model_name=model_name)
         inv_items = _normalize_items(split.get("invoice_items") or [])
@@ -618,6 +677,10 @@ def load_combined_invoice_packing_list(
             "total_net_weight": sum(x["net_weight"] for x in inv_items),
             "total_gross_weight": sum(x["gross_weight"] for x in inv_items),
             "total_pkg_count": sum(x["pkg_count"] for x in inv_items),
+            "total_items_sum": sum(x["amount"] for x in inv_items),
+            "is_non_commercial": bool(split.get("is_non_commercial")) or bool(_NONCOMM_RX.search(str(split.get("payment_terms") or ""))),
+            "payment_terms": str(split.get("payment_terms") or "").strip(),
+            "file_name": uploaded_file.name,
             "items": inv_items,
         }
         pk_doc = {
@@ -650,6 +713,17 @@ def merge_invoice_packing(results: list) -> tuple:
         for k in ("invoice_no", "invoice_date", "currency", "incoterms"):
             out[k] = next((d.get(k) for d in docs if str(d.get(k) or "").strip()), "")
         out.setdefault("containers", [])
+        # Từng invoice riêng (để biết tổng được cộng từ đâu, invoice nào không thương mại)
+        out["invoice_nos"] = [str(d.get("invoice_no") or "").strip() for d in docs if str(d.get("invoice_no") or "").strip()]
+        out["invoice_dates"] = [str(d.get("invoice_date") or "").strip() for d in docs if str(d.get("invoice_date") or "").strip()]
+        out["invoice_breakdown"] = [{
+            "invoice_no": str(d.get("invoice_no") or "").strip(), "invoice_date": str(d.get("invoice_date") or "").strip(),
+            "currency": str(d.get("currency") or "").strip().upper(), "total_amount": float(d.get("total_amount") or 0),
+            "total_items_sum": float(d.get("total_items_sum") or 0), "lines": len(d.get("items") or []),
+            "is_non_commercial": bool(d.get("is_non_commercial")), "file_name": d.get("file_name", ""),
+        } for d in docs]
+        out["is_non_commercial"] = any(bool(d.get("is_non_commercial")) for d in docs)
+        out["mixed_currency"] = len({str(d.get("currency") or "").strip().upper() for d in docs if str(d.get("currency") or "").strip()}) > 1
         return out
     return combine([r[0] for r in results]), combine([r[1] for r in results])
 
@@ -694,13 +768,30 @@ class TransportDocData(BaseModel):
     container_seals: list[ContainerSeal] = Field(default_factory=list, description="Số container kèm số seal tương ứng (nếu chứng từ có ghi seal)")
     total_pkg_count: float = Field(default=0.0, description="Tổng số kiện / packages")
     total_gross_weight: float = Field(default=0.0, description="Tổng Gross Weight (kg)")
+    charge_descriptions: list[str] = Field(default_factory=list, description="Tên TỪNG khoản phí / phụ phí ghi trên chứng từ (nếu có), VD: OCEAN FREIGHT, THC, PCS, LSS, BAF. Để trống nếu chứng từ không liệt kê phí")
 
 
 class ChargeLine(BaseModel):
-    description: str = Field(default="", description="Tên khoản phí trên debit note (VD: OCEAN FREIGHT, BAF, THC, D/O FEE)")
-    amount: float = Field(default=0.0, description="Số tiền của khoản phí")
-    currency: str = Field(default="", description="Mã tiền tệ của khoản phí (USD, VND...)")
-    is_international_freight: bool = Field(default=False, description="True nếu là cước vận chuyển quốc tế hoặc phụ phí đi kèm cước (Ocean/Air freight, BAF, CAF, EBS, PSS, GRI, LSS...). False nếu là phí địa phương tại cảng đến (THC, D/O, CIC, handling, tờ khai, lưu bãi...)")
+    description: str = Field(default="", description="Tên khoản phí trên debit note, chép đúng như in")
+    amount: float = Field(default=0.0, description="Số tiền của dòng phí. Nếu chứng từ có cột 'tiền trước thuế' riêng thì lấy số TRƯỚC thuế (VAT); nếu chỉ có một cột số tiền thì lấy đúng số đó")
+    currency: str = Field(default="", description="Mã tiền tệ của khoản phí (USD, VND...). Hóa đơn GTGT tiếng Việt thường là VND")
+    category: str = Field(default="OTHER", description=(
+        "OCEAN_FREIGHT = cước vận chuyển chính (Ocean freight / Sea freight / Air freight / O.F / cước đường biển); "
+        "FREIGHT_SURCHARGE = phụ phí đi kèm cước (BAF, CAF, EBS, PSS, GRI, LSS, PCS...); "
+        "EXW = phí lấy hàng tại xưởng người bán (EXW charge, EXWORK, ex-works, phí đại lý, agent fee, phí đại lý Trung Quốc, pickup/origin charge...); "
+        "OTHER = mọi khoản còn lại (THC, D/O, CIC, handling, tờ khai, lưu bãi, vận chuyển nội địa...)"))
+    amount_includes_vat: bool = Field(default=False, description=(
+        "True CHỈ KHI số tiền đã điền ở amount còn bao gồm VAT. "
+        "False nếu amount là số trước VAT (kể cả khi VAT ghi ở cột/dòng riêng) hoặc khoản phí không chịu VAT"))
+    is_international_freight: bool = Field(default=False, description="True nếu category là OCEAN_FREIGHT hoặc FREIGHT_SURCHARGE")
+
+
+class InsuranceData(BaseModel):
+    policy_no: str = Field(default="", description="Số đơn / giấy chứng nhận bảo hiểm")
+    premium_amount: float = Field(default=0.0, description="Phí bảo hiểm (premium) CHƯA gồm VAT")
+    vat_amount: float = Field(default=0.0, description="Tiền VAT trên phí bảo hiểm nếu có")
+    premium_currency: str = Field(default="", description="Mã tiền tệ của phí bảo hiểm")
+    insured_value: float = Field(default=0.0, description="Số tiền / giá trị được bảo hiểm")
 
 
 class DebitNoteData(BaseModel):
@@ -914,7 +1005,8 @@ def load_document(
             "2) tên tàu kèm số chuyến (hoặc số chuyến bay), ngày ETA.\n"
             "3) danh sách TẤT CẢ số container (11 ký tự, 4 chữ + 7 số) và số seal tương ứng của từng container nếu có (container_seals).\n"
             "4) tổng số kiện (packages) và tổng Gross Weight (kg).\n"
-            "Nếu là Arrival Notice thì đọc thêm ngày DELIVERY (Delivery date) vào trường delivery_date. "
+            "Nếu là Arrival Notice thì đọc thêm ngày DELIVERY (Delivery date) vào trường delivery_date, "
+            "và liệt kê tên TỪNG khoản phí / phụ phí ghi trên Arrival Notice vào charge_descriptions (đặc biệt phụ phí tắc nghẽn cảng PCS / Port Congestion và phụ phí lưu huỳnh thấp LSS / Low Sulphur nếu có). "
             "Nếu không có trường nào thì để trống / 0."
         )
         data = _call_gemini_json(raw, prompt, TransportDocData, api_key=api_key, model_name=model_name)
@@ -935,46 +1027,65 @@ def load_document(
             "container_seals": _clean_seals(data.get("container_seals")),
             "total_pkg_count": _parse_vnaccs_number(data.get("total_pkg_count") or 0.0),
             "total_gross_weight": _parse_vnaccs_number(data.get("total_gross_weight") or 0.0),
+            "charge_descriptions": [str(x).strip() for x in (data.get("charge_descriptions") or []) if str(x).strip()],
             "items": [],
         }
 
-    # 4. Debit note (cước vận chuyển)
+    # 4. Debit note (cước vận chuyển) - có thể có nhiều file (phí OF và phí EXW tách riêng)
     if doc_type == "DEBIT_NOTE":
         if not name.endswith(".pdf"):
             raise ValueError(f"Debit note chỉ hỗ trợ file PDF: {uploaded_file.name}")
         if not api_key:
             raise ValueError("Cần nhập Gemini API Key để đọc file PDF Debit note.")
         prompt = (
-            "Đây là DEBIT NOTE của công ty giao nhận (forwarder). Liệt kê TỪNG khoản phí (charges) kèm số tiền và tiền tệ. "
-            "Đánh dấu is_international_freight = true cho cước vận chuyển quốc tế và các phụ phí đi kèm cước "
-            "(Ocean freight / Air freight, BAF, CAF, EBS, PSS, GRI, LSS, War risk...), "
-            "và false cho phí địa phương tại cảng/sân bay đến (THC, D/O fee, CIC, handling, phí tờ khai, vận chuyển nội địa, lưu bãi...). "
-            "freight_amount = tổng các khoản is_international_freight; freight_currency là tiền tệ của chúng "
-            "(nếu cước có nhiều tiền tệ khác nhau thì ghi riêng từng khoản trong charges và để freight_amount của tiền tệ chiếm đa số). "
-            "Ngoài ra ghi số debit note và tổng cộng toàn bộ debit note."
+            "Đây là DEBIT NOTE hoặc HÓA ĐƠN phí của công ty giao nhận (forwarder). Liệt kê TỪNG khoản phí (charges) kèm số tiền và tiền tệ. "
+            "Phân loại mỗi khoản vào category: OCEAN_FREIGHT (cước biển/hàng không chính), FREIGHT_SURCHARGE (BAF, CAF, EBS, PSS, LSS, PCS...), "
+            "EXW (phí lấy hàng tại xưởng người bán: có thể ghi là EXW charge, EXWORK, phí đại lý, phí đại lý Trung Quốc, agent fee, pickup...), "
+            "OTHER (THC, D/O, CIC, handling, phí tờ khai, vận chuyển nội địa, lưu bãi...). "
+            "amount: nếu chứng từ có cột 'tiền trước thuế' thì lấy số TRƯỚC VAT và đặt amount_includes_vat = false; "
+            "chỉ đặt amount_includes_vat = true khi bạn buộc phải lấy số đã gồm VAT. "
+            "Ghi thêm số debit note (hoặc số hóa đơn) và tổng cộng toàn bộ chứng từ."
         )
         data = _call_gemini_json(raw, prompt, DebitNoteData, api_key=api_key, model_name=model_name)
-        charges = [{
-            "description": str(c.get("description") or "").strip(),
-            "amount": _parse_vnaccs_number(c.get("amount") or 0.0),
-            "currency": str(c.get("currency") or "").strip().upper(),
-            "is_international_freight": bool(c.get("is_international_freight")),
-        } for c in (data.get("charges") or [])]
-        fr_cur = str(data.get("freight_currency") or "").strip().upper()
-        fr_amt = _parse_vnaccs_number(data.get("freight_amount") or 0.0)
-        # tính lại từ từng khoản để tránh lỗi cộng của mô hình
-        fr_lines = [c for c in charges if c["is_international_freight"] and c["amount"]]
-        if fr_lines:
-            cur_main = fr_cur or fr_lines[0]["currency"]
-            same = [c for c in fr_lines if (c["currency"] or cur_main) == cur_main]
-            fr_amt, fr_cur = sum(c["amount"] for c in same), cur_main
+        valid_cats = {"OCEAN_FREIGHT", "FREIGHT_SURCHARGE", "EXW", "OTHER"}
+        charges = []
+        for c in (data.get("charges") or []):
+            cat = str(c.get("category") or "OTHER").strip().upper()
+            cat = cat if cat in valid_cats else "OTHER"
+            charges.append({
+                "description": str(c.get("description") or "").strip(),
+                "amount": _parse_vnaccs_number(c.get("amount") or 0.0),
+                "currency": str(c.get("currency") or "").strip().upper(),
+                "category": cat,
+                "amount_includes_vat": bool(c.get("amount_includes_vat")),
+                "is_international_freight": cat in ("OCEAN_FREIGHT", "FREIGHT_SURCHARGE"),
+            })
         return {
             "doc_type": "DEBIT_NOTE",
             "debit_note_no": str(data.get("debit_note_no") or "").strip(),
-            "freight_amount": fr_amt,
-            "freight_currency": fr_cur,
             "total_amount": _parse_vnaccs_number(data.get("total_amount") or 0.0),
             "charges": charges,
+            "file_name": uploaded_file.name,
+        }
+
+    # 4b. Phí bảo hiểm
+    if doc_type == "INSURANCE":
+        if not name.endswith(".pdf"):
+            raise ValueError(f"Chứng từ bảo hiểm chỉ hỗ trợ file PDF: {uploaded_file.name}")
+        if not api_key:
+            raise ValueError("Cần nhập Gemini API Key để đọc file PDF bảo hiểm.")
+        prompt = (
+            "Đây là đơn / giấy chứng nhận bảo hiểm hàng hóa hoặc hóa đơn phí bảo hiểm. Trích xuất số đơn, "
+            "phí bảo hiểm (premium) CHƯA gồm VAT, tiền VAT (nếu có), mã tiền tệ của phí và giá trị được bảo hiểm."
+        )
+        data = _call_gemini_json(raw, prompt, InsuranceData, api_key=api_key, model_name=model_name)
+        return {
+            "doc_type": "INSURANCE",
+            "policy_no": str(data.get("policy_no") or "").strip(),
+            "premium_amount": _parse_vnaccs_number(data.get("premium_amount") or 0.0),
+            "vat_amount": _parse_vnaccs_number(data.get("vat_amount") or 0.0),
+            "premium_currency": str(data.get("premium_currency") or "").strip().upper(),
+            "insured_value": _parse_vnaccs_number(data.get("insured_value") or 0.0),
             "file_name": uploaded_file.name,
         }
 
@@ -1095,7 +1206,7 @@ def load_history_report(uploaded_file) -> dict:
 
 
 # Đổi chuỗi này mỗi lần sửa cách đọc chứng từ: app dùng làm một phần khóa cache nên kết quả đọc cũ không bị dùng lại
-PARSER_VERSION = "2026-11-27c"
+PARSER_VERSION = "2026-11-28a"
 
 
 # ===================== NGÀY THÁNG: ĐƯA VỀ dd/mm/yyyy =====================
@@ -1318,6 +1429,16 @@ def _note(severity, field, draft_val, doc_val, note) -> dict:
     return {"severity": severity, "field": field, "draft_val": draft_val, "doc_val": doc_val, "note": note}
 
 
+def _sum_by_first_decl(members: list[dict], key: str) -> float:
+    """Cộng 1 khoản phí (cước / bảo hiểm) của bộ tờ khai: các nhánh cùng Số TK đầu tiên chỉ lấy 1 lần (số lớn nhất),
+    giữa các tờ khai độc lập thì cộng dồn."""
+    by_first: dict[str, float] = {}
+    for d in members:
+        k = d.get("first_declaration_no") or d.get("declaration_no") or str(id(d))
+        by_first[k] = max(by_first.get(k, 0.0), float(d.get(key) or 0))
+    return sum(by_first.values())
+
+
 def merge_declarations(decls: list[dict], bl_hint: str = "") -> dict:
     """
     Gộp các tờ khai đính kèm thành 1 bộ để đối chiếu với 1 bộ chứng từ (1 Bill).
@@ -1460,12 +1581,19 @@ def merge_declarations(decls: list[dict], bl_hint: str = "") -> dict:
         "customer_rule": next((d.get("customer_rule") for d in members if d.get("customer_rule")), {}),
         "exchange_rates": {k: v for d in members for k, v in (d.get("exchange_rates") or {}).items()},
         "freight_currency": first_nonblank("freight_currency"),
+        "insurance_currency": first_nonblank("insurance_currency"),
         "decl_meta": [{
             "declaration_no": d.get("declaration_no", ""), "check_class_code": d.get("check_class_code", ""),
+            # Số TK đầu tiên + nhánh: checker dùng để biết tờ khai nào là NHÁNH của cùng 1 tờ khai
+            # (nhánh -> cước/bảo hiểm giữ nguyên, không phân bổ)
+            "first_declaration_no": d.get("first_declaration_no") or d.get("declaration_no", ""),
+            "branch_no": d.get("branch_no", ""), "total_branches": d.get("total_branches", ""),
             "transport_mode_code": d.get("transport_mode_code", ""),
             "internal_ref_no": d.get("internal_ref_no", ""), "container_count": d.get("container_count", ""),
             "incoterms": d.get("incoterms", ""), "currency": d.get("currency", ""),
             "freight_amount": float(d.get("freight_amount") or 0), "freight_currency": d.get("freight_currency", ""),
+            "insurance_amount": float(d.get("insurance_amount") or 0), "insurance_currency": d.get("insurance_currency", ""),
+            "payment_method": str(d.get("payment_method") or "").strip().upper(), "invoice_no_clean": d.get("invoice_no_clean") or clean_invoice_no(d.get("invoice_no")),
             "goods_value": sum(float(it.get("amount") or 0) for it in (d.get("items") or [])) or float(d.get("total_amount") or 0),
             "exchange_rates": d.get("exchange_rates") or {},
             "decl_type": d.get("declaration_type_code", ""),
@@ -1478,8 +1606,10 @@ def merge_declarations(decls: list[dict], bl_hint: str = "") -> dict:
         "containers": containers,
         "currency": first_nonblank("currency"),
         "incoterms": first_nonblank("incoterms"),
-        "freight_amount": sum(float(d.get("freight_amount") or 0) for d in members),
-        "insurance_amount": sum(float(d.get("insurance_amount") or 0) for d in members),
+        # Nhánh của cùng 1 tờ khai ghi cùng 1 số cước (cước cả bill) -> chỉ tính 1 lần / nhóm nhánh,
+        # các tờ khai KHÁC nhau cùng bill thì cộng lại.
+        "freight_amount": _sum_by_first_decl(members, "freight_amount"),
+        "insurance_amount": _sum_by_first_decl(members, "insurance_amount"),
         "total_pkg_count": combine("total_pkg_count", "Tổng số kiện"),
         "total_gross_weight": combine("total_gross_weight", "Tổng Gross Weight"),
         "total_net_weight": combine("total_net_weight", "Tổng Net Weight"),

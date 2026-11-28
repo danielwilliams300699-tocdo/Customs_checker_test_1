@@ -2,6 +2,7 @@ import copy
 import hashlib
 import io
 import os
+import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from concurrent.futures import TimeoutError as FuturesTimeout
@@ -12,7 +13,10 @@ from extractors import (
     load_document, load_history_report_cached, load_combined_invoice_packing_list,
     merge_invoice_packing, merge_declarations, PARSER_VERSION,
 )
-from checker import run_full_reconciliation, style_result
+from checker import (
+    run_full_reconciliation, style_result, _convert, CAT_LABEL, CAT_BY_LABEL,
+    incoterm3, default_charge_tick, charge_net, collect_notices,
+)
 
 CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cache_lichsu")
 TASK_TIMEOUT_S = 420   # tổng thời gian chờ tối đa cho bước đọc chứng từ
@@ -45,10 +49,11 @@ with col1:
              "Nếu Invoice và Packing List ở 2 file riêng thì tải cả 2 vào đây.",
     )
     f_debit = st.file_uploader(
-        "3. Debit note cước vận chuyển (PDF)",
+        "3. Debit note cước vận chuyển (PDF) - tải được nhiều file",
         type=["pdf"],
-        help="So cước vận chuyển quốc tế trên debit note với phí vận chuyển trên tờ khai (quy đổi theo tỷ giá tính thuế trong tờ khai; "
-             "1 debit note chia nhiều tờ khai thì phân bổ theo trị giá hàng).",
+        accept_multiple_files=True,
+        help="Phí OF và phí EXW ở 2 debit note khác nhau thì tải cả 2. Điều kiện F*: mặc định chỉ tick Ocean Freight; "
+             "EXW: tick thêm phí EXW/đại lý (tính chưa VAT 8%). Bạn có thể tick lại / thêm dòng ở bảng sau khi đọc.",
     )
 with col2:
     f_bl = st.file_uploader("4. Bill of Lading - B/L (PDF)", type=["pdf"])
@@ -71,6 +76,12 @@ with col3:
         accept_multiple_files=True,
         help="Dùng khi tờ khai nhập có mã hiệu phương thức vận chuyển (số đứng cạnh mã loại hình, VD E31 2 [4]) = 9: số quản lý nội bộ "
              "NKTC#&xxxxxxxxxxx hoặc NKPTQ#&xxxxxxxxxxx phải trùng 11 số đầu tiên của số tờ khai xuất.",
+    )
+    f_insurance = st.file_uploader(
+        "9. Phí bảo hiểm (PDF) - tải được nhiều file",
+        type=["pdf"],
+        accept_multiple_files=True,
+        help="So phí bảo hiểm (chưa VAT) với phí bảo hiểm trên tờ khai (quy đổi theo tỷ giá tính thuế trong tờ khai).",
     )
 
 
@@ -104,25 +115,28 @@ def _load_history_cached(f, cache):
     return master
 
 
+# ---------------- GIAI ĐOẠN 1: đọc chứng từ (gọi Gemini, có cache) ----------------
 if st.button("Chạy đối chiếu ngay", type="primary"):
     if not f_drafts:
         st.error("Vui lòng tải lên ít nhất 1 file **Tờ khai nháp** trước.")
         st.stop()
-
     try:
         cache = st.session_state.setdefault("doc_cache", {})
         t0 = time.time()
         results: dict = {}
-
         with st.status("Đang đọc chứng từ...", expanded=True) as status:
             tasks = {}   # tên hiển thị -> (khóa kết quả, hàm)
             for i, f in enumerate(f_drafts):
                 tasks[f"Tờ khai nháp: {f.name}"] = (("draft", i), lambda f=f: _load_cached(f, "DRAFT_DECL", cache, api_key, model_name))
             for i, f in enumerate(f_invpk or []):
                 tasks[f"Invoice + Packing List: {f.name}"] = (("invpk", i), lambda f=f: _load_invpk_cached(f, cache, api_key, model_name))
-            for key, f, dt, label in [("bl", f_bl, "BL", "B/L"), ("an", f_an, "ARRIVAL_NOTICE", "Arrival Notice"), ("debit", f_debit, "DEBIT_NOTE", "Debit note")]:
+            for key, f, dt, label in [("bl", f_bl, "BL", "B/L"), ("an", f_an, "ARRIVAL_NOTICE", "Arrival Notice")]:
                 if f is not None:
                     tasks[f"{label}: {f.name}"] = ((key, 0), lambda f=f, dt=dt: _load_cached(f, dt, cache, api_key, model_name))
+            for i, f in enumerate(f_debit or []):
+                tasks[f"Debit note: {f.name}"] = (("debit", i), lambda f=f: _load_cached(f, "DEBIT_NOTE", cache, api_key, model_name))
+            for i, f in enumerate(f_insurance or []):
+                tasks[f"Bảo hiểm: {f.name}"] = (("insurance", i), lambda f=f: _load_cached(f, "INSURANCE", cache, api_key, model_name))
             for i, f in enumerate(f_barcodes or []):
                 tasks[f"Mã vạch: {f.name}"] = (("barcode", i), lambda f=f: _load_cached(f, "BARCODE", cache, api_key, model_name))
             for i, f in enumerate(f_exports or []):
@@ -154,41 +168,109 @@ if st.button("Chạy đối chiếu ngay", type="primary"):
                     )
             finally:
                 ex.shutdown(wait=False, cancel_futures=True)   # không chờ các file bị treo
+            status.update(label=f"Đã đọc xong sau {time.time() - t0:.1f}s", state="complete", expanded=False)
 
-            status.update(label="Đang gộp tờ khai và đối chiếu...")
-            draft_docs = [copy.deepcopy(results[("draft", i)]) for i in range(len(f_drafts))]
-            inv_doc, pk_doc = merge_invoice_packing([results[("invpk", i)] for i in range(len(f_invpk or []))]) if f_invpk else (None, None)
-            inv_doc, pk_doc = copy.deepcopy(inv_doc), copy.deepcopy(pk_doc)
-            bl_doc = copy.deepcopy(results.get(("bl", 0)))
-            an_doc = copy.deepcopy(results.get(("an", 0)))
-            debit_doc = copy.deepcopy(results.get(("debit", 0)))
-            barcode_docs = [copy.deepcopy(results[("barcode", i)]) for i in range(len(f_barcodes or []))]
-            export_docs = [results[("export", i)] for i in range(len(f_exports or []))]
-            master = results.get(("hist", 0))
+        st.session_state["parsed"] = {
+            "results": results, "stamp": time.time(),
+            "n": {"draft": len(f_drafts), "invpk": len(f_invpk or []), "debit": len(f_debit or []),
+                  "insurance": len(f_insurance or []), "barcode": len(f_barcodes or []), "export": len(f_exports or [])},
+            "hist_name": f_hist.name if f_hist is not None else "",
+        }
+    except Exception as exc:
+        st.session_state.pop("parsed", None)
+        st.error(f"Có lỗi xảy ra: {exc}")
 
-            # Gộp các tờ khai (nhánh / nhiều TK cùng bill); dùng số bill trên B/L hoặc A/N để chọn đúng nhóm
-            bl_hint = (bl_doc or {}).get("bl_no") or (an_doc or {}).get("bl_no") or ""
-            draft_merged = merge_declarations(draft_docs, bl_hint=bl_hint)
 
-            res = run_full_reconciliation(
-                draft=draft_merged,
-                invoice=inv_doc,
-                packing_list=pk_doc,
-                bl=bl_doc,
-                arrival_notice=an_doc,
-                weight_tol=weight_tol,
-                amount_tol=amount_tol,
-                master=master,
-                export_decls=export_docs,
-                debit_note=debit_doc,
-                barcodes=barcode_docs,
+# ---------------- GIAI ĐOẠN 2: gộp, chọn khoản phí, đối chiếu (chạy lại mỗi lần tick, KHÔNG gọi lại Gemini) ----------------
+parsed = st.session_state.get("parsed")
+if parsed:
+    try:
+        results, n = parsed["results"], parsed["n"]
+        draft_docs = [copy.deepcopy(results[("draft", i)]) for i in range(n["draft"])]
+        inv_doc, pk_doc = merge_invoice_packing([results[("invpk", i)] for i in range(n["invpk"])]) if n["invpk"] else (None, None)
+        inv_doc, pk_doc = copy.deepcopy(inv_doc), copy.deepcopy(pk_doc)
+        bl_doc = copy.deepcopy(results.get(("bl", 0)))
+        an_doc = copy.deepcopy(results.get(("an", 0)))
+        debit_docs = [results[("debit", i)] for i in range(n["debit"])]
+        insurance_docs = [copy.deepcopy(results[("insurance", i)]) for i in range(n["insurance"])]
+        barcode_docs = [copy.deepcopy(results[("barcode", i)]) for i in range(n["barcode"])]
+        export_docs = [results[("export", i)] for i in range(n["export"])]
+        master = results.get(("hist", 0))
+
+        # Gộp các tờ khai (nhánh / nhiều TK cùng bill); dùng số bill trên B/L hoặc A/N để chọn đúng nhóm
+        bl_hint = (bl_doc or {}).get("bl_no") or (an_doc or {}).get("bl_no") or ""
+        draft_merged = merge_declarations(draft_docs, bl_hint=bl_hint)
+
+        # ---- Thông báo cần lưu ý (PCS / LSS trên debit note, A/N; HS đầu 28/29 = hóa chất) ----
+        notices = collect_notices(debit_docs, an_doc, draft_merged)
+        if notices:
+            st.warning("**Thông báo cần lưu ý**\n\n" + "\n".join(f"- {t}" for t in notices))
+
+        # ---- Bảng chọn khoản phí tính vào phí vận chuyển ----
+        debit_note = None
+        if debit_docs:
+            inc = incoterm3(draft_merged.get("incoterms"))
+            rows = []
+            for dn in debit_docs:
+                for c in dn.get("charges") or []:
+                    cat = c.get("category", "OTHER")
+                    rows.append({
+                        "Chọn": default_charge_tick(inc, cat, c.get("is_international_freight")),
+                        "Debit note": dn.get("file_name", ""), "Khoản phí": c["description"],
+                        "Loại": CAT_LABEL.get(cat, "Khác"), "Số tiền": c["amount"], "Tiền tệ": c["currency"],
+                        "Đã gồm VAT 8%": bool(c.get("amount_includes_vat")),
+                    })
+            st.subheader("Chọn khoản phí tính vào phí vận chuyển")
+            st.caption(
+                f"Incoterm trên tờ khai: **{inc or '?'}**. "
+                + ("F*: mặc định chỉ tick Ocean Freight. " if inc.startswith("F") else "")
+                + ("EXW: mặc định tick Ocean Freight + phí EXW/đại lý. " if inc == "EXW" else "")
+                + "Bạn tick thêm/bỏ tick, thêm dòng mới (bấm dòng trống cuối bảng) hoặc sửa số tiền tùy ý. "
+                  "Dòng tick 'Đã gồm VAT 8%' sẽ được chia 1,08 để lấy số chưa VAT."
             )
-            status.update(label=f"Hoàn tất sau {time.time() - t0:.1f}s", state="complete", expanded=False)
+            base_df = pd.DataFrame(rows, columns=["Chọn", "Debit note", "Khoản phí", "Loại", "Số tiền", "Tiền tệ", "Đã gồm VAT 8%"])
+            edited = st.data_editor(
+                base_df, hide_index=True, use_container_width=True, num_rows="dynamic",
+                key=f"dn_editor_{parsed['stamp']}",
+                disabled=["Debit note"],
+                column_config={
+                    "Loại": st.column_config.SelectboxColumn("Loại", options=list(CAT_LABEL.values())),
+                    "Số tiền": st.column_config.NumberColumn("Số tiền", format="%.2f"),
+                },
+            )
+            edited = edited.fillna({"Chọn": False, "Debit note": "", "Khoản phí": "", "Loại": "Khác",
+                                    "Số tiền": 0.0, "Tiền tệ": "", "Đã gồm VAT 8%": False})
+            sel = edited[edited["Chọn"].astype(bool)]
+            rates = draft_merged.get("exchange_rates") or {}
+            cur_main = next((str(x).strip().upper() for x in sel["Tiền tệ"] if str(x).strip()), "")
+            total, charges_sel, fails = 0.0, [], []
+            for _, r in sel.iterrows():
+                net = charge_net(float(r["Số tiền"]), bool(r["Đã gồm VAT 8%"]))
+                conv, note = _convert(net, str(r["Tiền tệ"]).strip().upper() or cur_main, cur_main, rates)
+                if conv is None:
+                    fails.append(f"{r['Khoản phí']}: {note}")
+                    continue
+                total += conv
+                charges_sel.append({"description": r["Khoản phí"], "amount": round(net, 2), "currency": r["Tiền tệ"]})
+            if fails:
+                st.warning("Không quy đổi được: " + "; ".join(fails))
+            st.info(f"Tổng cước tính vào phí vận chuyển: **{total:,.2f} {cur_main}** ({len(charges_sel)} khoản được chọn)")
+            debit_note = {
+                "doc_type": "DEBIT_NOTE",
+                "debit_note_no": ", ".join(d.get("debit_note_no", "") for d in debit_docs if d.get("debit_note_no")),
+                "freight_amount": total, "freight_currency": cur_main, "charges": charges_sel,
+            }
+
+        res = run_full_reconciliation(
+            draft=draft_merged, invoice=inv_doc, packing_list=pk_doc, bl=bl_doc, arrival_notice=an_doc,
+            weight_tol=weight_tol, amount_tol=amount_tol, master=master, export_decls=export_docs,
+            debit_note=debit_note, barcodes=barcode_docs, insurance=insurance_docs,
+        )
 
         if master:
             m = getattr(master, "meta", {}) or {}
             st.info(
-                f"Từ điển lấy từ báo cáo: **{f_hist.name}** | Doanh nghiệp: **{m.get('ten_dn') or '?'}** "
+                f"Từ điển lấy từ báo cáo: **{parsed['hist_name']}** | Doanh nghiệp: **{m.get('ten_dn') or '?'}** "
                 f"(MST {m.get('ma_dn') or '?'}) | Khai từ {m.get('tu_ngay') or '?'} đến {m.get('den_ngay') or '?'} | "
                 f"{m.get('so_dong', 0):,} dòng hàng -> {len(master):,} mã hàng (lấy theo lần khai gần nhất)."
             )
@@ -198,11 +280,14 @@ if st.button("Chạy đối chiếu ngay", type="primary"):
         decl_df = pd.DataFrame(draft_merged["declarations"])
         with st.expander(f"Bộ tờ khai đã gộp để đối chiếu ({len(decl_df)} tờ khai)", expanded=len(decl_df) > 1):
             st.dataframe(decl_df, use_container_width=True, hide_index=True)
-        if debit_doc and debit_doc.get("charges"):
-            with st.expander("Chi tiết debit note (khoản nào được tính là cước vận chuyển quốc tế)"):
-                st.dataframe(pd.DataFrame(debit_doc["charges"]).rename(columns={
-                    "description": "Khoản phí", "amount": "Số tiền", "currency": "Tiền tệ", "is_international_freight": "Tính vào cước quốc tế"}),
-                    use_container_width=True, hide_index=True)
+
+        if inv_doc and inv_doc.get("invoice_breakdown"):
+            with st.expander(f"Chi tiết từng invoice ({len(inv_doc['invoice_breakdown'])} invoice) - tổng trị giá được cộng từ đây", expanded=True):
+                bd = pd.DataFrame(inv_doc["invoice_breakdown"]).rename(columns={
+                    "invoice_no": "Số invoice", "invoice_date": "Ngày", "currency": "Tiền tệ", "total_amount": "Tổng ghi trên invoice",
+                    "total_items_sum": "Tổng cộng các dòng", "lines": "Số dòng", "is_non_commercial": "Không thương mại (không thanh toán)",
+                    "file_name": "File"})
+                st.dataframe(bd, use_container_width=True, hide_index=True)
 
         st.subheader("Tóm tắt kết quả")
         st.dataframe(res["summary"], use_container_width=True, hide_index=True)
@@ -229,6 +314,8 @@ if st.button("Chạy đối chiếu ngay", type="primary"):
             res["issues"].to_excel(writer, sheet_name="Discrepancies", index=False)
             decl_df.to_excel(writer, sheet_name="Declarations", index=False)
             res["header_table"].to_excel(writer, sheet_name="Thong_tin_chung", index=False)
+            if notices:
+                pd.DataFrame({"Thông báo cần lưu ý": notices}).to_excel(writer, sheet_name="Thong_bao", index=False)
             for name, df_ in res["line_tables"].items():
                 sheet = {"Invoice": "TK_vs_Invoice", "Packing List": "TK_vs_PackingList", "Lịch sử khai báo": "TK_vs_LichSu"}.get(name, name[:31])
                 style_result(df_).to_excel(writer, sheet_name=sheet, index=False)
